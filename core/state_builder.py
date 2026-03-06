@@ -32,8 +32,8 @@ def build_derived_state(states: List[DailyState], idx: int, assumptions: GameAss
 
     state = states[idx]
     prev = states[idx - 1] if idx > 0 else state
-    last_day = max(s.day for s in states)
-    days_remaining = max(0, last_day - state.day)
+    days_remaining = max(0, assumptions.total_game_days - state.day)
+    days_remaining_control = max(0, assumptions.player_control_last_day - state.day)
 
     expected_std = rolling_mean([s.std_deliveries or s.std_accepted_orders for s in states[max(0, idx - 4): idx + 1]], 5)
     expected_cus = rolling_mean([s.cus_deliveries or s.cus_accepted_orders for s in states[max(0, idx - 4): idx + 1]], 5)
@@ -122,7 +122,7 @@ def build_derived_state(states: List[DailyState], idx: int, assumptions: GameAss
         1,
     )
 
-    if days_remaining <= assumptions.frozen_last_days:
+    if state.day >= assumptions.player_control_last_day:
         regime = "Endgame"
     elif raw_coverage < assumptions.raw_lead_time_days or cus_wip_ratio > 0.85 or cash_buffer_adequacy < 0.8 or system_stress > 0.7:
         regime = "Recovery"

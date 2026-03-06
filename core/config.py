@@ -37,7 +37,8 @@ class GameAssumptions:
     machine_sell_value_s3: float = 4000.0
 
     frozen_last_days: int = 50
-    early_control_days: int = 50
+    total_game_days: int = 400
+    player_control_last_day: int = 350
     forecast_horizon_days: int = 15
 
     min_cash_buffer_days: int = 7
