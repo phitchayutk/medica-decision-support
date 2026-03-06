@@ -1,188 +1,333 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Dict, Tuple
 
-from .config import GameAssumptions
-from .schemas import DailyState, DerivedState
-from .utils import clamp, nz, rolling_mean, safe_div
+import pandas as pd
 
-
-def _diff(current: float, previous: float) -> float:
-    return nz(current) - nz(previous)
+from core.data_loader import load_game_data
 
 
-def _compute_raw_on_order(states: List[DailyState], idx: int, lead_time: int) -> float:
-    start = max(0, idx - lead_time + 1)
-    pending = sum(nz(states[i].inventory_dispatches) for i in range(start, idx + 1))
-    return pending
+def safe_div(a: float, b: float, default: float = 0.0) -> float:
+    return a / b if b not in (0, 0.0) else default
 
 
-def _next_stockout_day(on_hand: float, parts_per_day: float, current_day: int) -> Optional[float]:
-    if parts_per_day <= 0:
+def to_float(x, default: float = 0.0) -> float:
+    try:
+        if pd.isna(x):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def pick_col(df: pd.DataFrame, aliases):
+    if df is None or df.empty:
         return None
-    coverage = on_hand / parts_per_day
-    if coverage < 0:
-        coverage = 0
-    return current_day + coverage
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    for a in aliases:
+        if a in df.columns:
+            return a
+    for a in aliases:
+        key = str(a).strip().lower()
+        if key in lower_map:
+            return lower_map[key]
+    return None
 
 
-def build_derived_state(states: List[DailyState], idx: int, assumptions: GameAssumptions) -> DerivedState:
-    if not states:
-        raise ValueError("No states loaded")
+def get_val(row: pd.Series, df: pd.DataFrame, aliases, default: float = 0.0) -> float:
+    c = pick_col(df, aliases)
+    if c is None:
+        return default
+    return to_float(row.get(c, default), default)
 
-    state = states[idx]
-    prev = states[idx - 1] if idx > 0 else state
-    days_remaining = max(0, assumptions.total_game_days - state.day)
-    days_remaining_control = max(0, assumptions.player_control_last_day - state.day)
 
-    expected_std = rolling_mean([s.std_deliveries or s.std_accepted_orders for s in states[max(0, idx - 4): idx + 1]], 5)
-    expected_cus = rolling_mean([s.cus_deliveries or s.cus_accepted_orders for s in states[max(0, idx - 4): idx + 1]], 5)
-    expected_parts = assumptions.standard_parts_per_unit * expected_std + assumptions.custom_parts_per_unit * expected_cus
+@dataclass
+class InventoryState:
+    inventory_level: float
+    dispatches: float
 
-    raw_on_hand = nz(state.inventory_level)
-    raw_on_order = _compute_raw_on_order(states, idx, assumptions.raw_lead_time_days)
-    inventory_position = raw_on_hand + raw_on_order
-    raw_coverage = safe_div(inventory_position, expected_parts, 999.0)
-    raw_stockout_day = _next_stockout_day(inventory_position, expected_parts, state.day)
-    raw_stockout_risk = clamp((assumptions.raw_lead_time_days + 2 - raw_coverage) / (assumptions.raw_lead_time_days + 2), 0, 1)
 
-    std_total_queue = sum([state.std_q1, state.std_q2, state.std_q3, state.std_q4, state.std_q5])
-    prev_std_total_queue = sum([prev.std_q1, prev.std_q2, prev.std_q3, prev.std_q4, prev.std_q5])
-    std_queue_growth = _diff(std_total_queue, prev_std_total_queue)
-    std_demand_gap = nz(state.std_accepted_orders) - nz(state.std_deliveries)
-    std_price_gap = nz(state.std_market_price)
-    std_s1_capacity_proxy = max(1.0, nz(state.std_s1_output))
-    std_resource_pressure_s1 = safe_div(state.std_q1 + state.std_accepted_orders, std_s1_capacity_proxy, 0.0)
-    batch_mismatch = (
-        abs(state.std_s1_output - state.std_initial_batch_output)
-        + abs(state.std_initial_batch_output - state.std_manual_output)
-        + abs(state.std_manual_output - state.std_final_batch_output)
-        + abs(state.std_final_batch_output - state.std_deliveries)
+@dataclass
+class StandardState:
+    accepted_orders: float
+    accumulated_orders: float
+    q1: float
+    s1_output: float
+    q_before_batch: float
+    initial_batch_output: float
+    q3: float
+    manual_output: float
+    q_manual: float
+    final_batch_output: float
+    fg_inventory: float
+    deliveries: float
+    market_price: float
+    s1_machines: int
+
+
+@dataclass
+class CustomState:
+    accepted_orders: float
+    accumulated_orders: float
+    q1: float
+    s1_output: float
+    q2_first: float
+    s2_first_output: float
+    q3: float
+    s3_output: float
+    q2_second: float
+    deliveries: float
+    demand: float
+    s2_machines: int
+    s3_machines: int
+    actual_price: float
+    average_lead_time: float
+
+
+@dataclass
+class WorkforceState:
+    rookies: int
+    experts: int
+
+
+@dataclass
+class FinancialState:
+    cash_on_hand: float
+    debt: float
+    inventory_costs_to_date: float
+    commission_interest_costs_to_date: float
+    machines_bought_to_date: float
+    salaries_to_date: float
+    standard_ordering_costs_to_date: float
+    interest_earned_to_date: float
+    sales_custom_to_date: float
+    sales_standard_to_date: float
+    machines_sold_to_date: float
+    raw_holding_costs_to_date: float
+    custom_queue_holding_costs_to_date: float
+    standard_queue_holding_costs_to_date: float
+
+
+@dataclass
+class PlantState:
+    day: int
+    inventory: InventoryState
+    standard: StandardState
+    custom: CustomState
+    workforce: WorkforceState
+    finance: FinancialState
+
+
+@dataclass
+class DerivedState:
+    raw_coverage_days: float
+    expected_parts_per_day: float
+    std_avg_demand_per_day: float
+    custom_avg_demand_per_day: float
+
+    s1_utilization: float
+    s2_utilization: float
+    s3_utilization: float
+    manual_utilization: float
+
+    std_batching_mismatch_score: float
+    custom_congestion_score: float
+    stress_score: float
+    endgame_robustness: float
+
+    bottleneck: str
+    current_regime: str
+
+    std_q2: float
+    custom_total_wip: float
+
+
+def _latest_row(df: pd.DataFrame):
+    if df is None or df.empty:
+        return pd.Series(dtype=object)
+    return df.sort_values("Day").iloc[-1]
+
+
+def build_derived_state(file_obj, assumptions) -> Tuple[PlantState, DerivedState, Dict[str, pd.DataFrame]]:
+    raw = load_game_data(file_obj)
+
+    std_df = raw["Standard"]
+    cus_df = raw["Custom"]
+    inv_df = raw["Inventory"]
+    fin_df = raw["Financial"]
+    wf_df = raw["WorkForce"]
+
+    std = _latest_row(std_df)
+    cus = _latest_row(cus_df)
+    inv = _latest_row(inv_df)
+    fin = _latest_row(fin_df)
+    wf = _latest_row(wf_df)
+
+    day = int(
+        max(
+            to_float(std.get("Day", 0)),
+            to_float(cus.get("Day", 0)),
+            to_float(inv.get("Day", 0)),
+            to_float(fin.get("Day", 0)),
+            to_float(wf.get("Day", 0)),
+        )
     )
-    std_ordering_pattern_score = clamp(safe_div(abs(std_demand_gap), max(expected_std, 1), 0.0), 0, 3)
-    std_wip_pressure = safe_div(std_total_queue, max(expected_std * 5, 1.0), 0.0)
 
-    cus_total_wip = state.cus_q1 + state.cus_q2_first + state.cus_q2_second + state.cus_q3
-    prev_cus_total_wip = prev.cus_q1 + prev.cus_q2_first + prev.cus_q2_second + prev.cus_q3
-    cus_queue_growth = _diff(cus_total_wip, prev_cus_total_wip)
-    cus_wip_ratio = safe_div(cus_total_wip, assumptions.custom_wip_limit, 0.0)
-    cus_demand_gap = nz(state.cus_demand) - nz(state.cus_deliveries)
-    cus_lt_trend = _diff(state.cus_avg_lead_time, prev.cus_avg_lead_time)
-    q2_total = state.cus_q2_first + state.cus_q2_second
-    cus_s2_imbalance = safe_div(abs(state.cus_q2_first - state.cus_q2_second), max(q2_total, 1.0), 0.0)
-    cus_congestion = clamp(0.45 * cus_wip_ratio + 0.25 * safe_div(max(cus_demand_gap, 0), max(expected_cus, 1), 0) + 0.20 * clamp(cus_lt_trend / 5, 0, 1) + 0.10 * cus_s2_imbalance, 0, 1)
-    cus_service_risk = clamp(0.60 * cus_congestion + 0.40 * clamp(state.cus_avg_lead_time / 20, 0, 1), 0, 1)
-
-    total_s1_load = state.std_q1 + state.cus_q1 + state.std_accepted_orders + state.cus_accepted_orders
-    total_s1_out = max(1.0, state.std_s1_output + state.cus_s1_output)
-    s1_pressure = safe_div(total_s1_load, total_s1_out, 0.0)
-    s2_pressure = safe_div(state.cus_q2_first + state.cus_q2_second + state.cus_s2_first_output, max(state.cus_s2_first_output, 1.0), 0.0)
-    s3_pressure = safe_div(state.cus_q3 + state.cus_s3_output, max(state.cus_s3_output, 1.0), 0.0)
-    manual_capacity_proxy = max(1.0, state.std_manual_output)
-    manual_pressure = safe_div(state.std_q3 + state.std_manual_output, manual_capacity_proxy, 0.0)
-    effective_workers = state.experts + assumptions.rookie_productivity_ratio * state.rookies
-    workforce_capacity_adequacy = safe_div(effective_workers, max(12.0, state.std_manual_output / 12.0), 0.0)
-
-    daily_rev = (state.sales_custom_to_date - prev.sales_custom_to_date) + (state.sales_standard_to_date - prev.sales_standard_to_date)
-    daily_holding = (state.raw_holding_costs_to_date - prev.raw_holding_costs_to_date) + (state.custom_queue_holding_costs_to_date - prev.custom_queue_holding_costs_to_date) + (state.standard_queue_holding_costs_to_date - prev.standard_queue_holding_costs_to_date)
-    salary_burden = state.salaries_to_date - prev.salaries_to_date
-    debt_burden = state.commission_interest_costs_to_date - prev.commission_interest_costs_to_date
-    cash_buffer_need = assumptions.min_cash_buffer_days * max(1.0, salary_burden + daily_holding + assumptions.raw_order_fee / assumptions.raw_lead_time_days)
-    cash_buffer_adequacy = safe_div(state.cash_on_hand, cash_buffer_need, 0.0)
-    loan_urgency = clamp(0.50 * clamp((1.0 - cash_buffer_adequacy), 0, 1) + 0.30 * raw_stockout_risk + 0.20 * cus_service_risk, 0, 1)
-
-    bottleneck_scores = {
-        "Raw Inventory": raw_stockout_risk * 1.3,
-        "Shared S1": clamp((s1_pressure - 1.0) / 1.5, 0, 1) + 0.2 * clamp(std_resource_pressure_s1 / 3, 0, 1),
-        "Initial / Standard Flow": clamp(std_wip_pressure / 2.0, 0, 1) + 0.2 * clamp(batch_mismatch / max(expected_std, 1), 0, 1),
-        "Manual Process": clamp((manual_pressure - 1.0) / 1.5, 0, 1),
-        "Custom S2": clamp((s2_pressure - 1.0) / 1.5, 0, 1) + 0.3 * cus_s2_imbalance,
-        "Custom S3": clamp((s3_pressure - 1.0) / 1.5, 0, 1),
-        "Cash": clamp((1.0 - cash_buffer_adequacy), 0, 1) + 0.2 * clamp(state.debt / max(state.cash_on_hand, 1), 0, 1),
-    }
-    current_bottleneck = max(bottleneck_scores, key=bottleneck_scores.get)
-
-    system_stress = clamp(
-        0.25 * raw_stockout_risk
-        + 0.25 * cus_congestion
-        + 0.15 * clamp(std_queue_growth / max(expected_std, 1), 0, 1)
-        + 0.15 * clamp(cus_queue_growth / max(expected_cus, 1), 0, 1)
-        + 0.10 * clamp((s1_pressure - 1) / 1.5, 0, 1)
-        + 0.10 * clamp((1 - cash_buffer_adequacy), 0, 1),
-        0,
-        1,
+    state = PlantState(
+        day=day,
+        inventory=InventoryState(
+            inventory_level=get_val(inv, inv_df, ["Inventory-Level"], 0.0),
+            dispatches=get_val(inv, inv_df, ["Inventory-Dispatches"], 0.0),
+        ),
+        standard=StandardState(
+            accepted_orders=get_val(std, std_df, ["Standard Orders-Accepted Orders"], 0.0),
+            accumulated_orders=get_val(std, std_df, ["Standard Orders-Accumulated Orders"], 0.0),
+            q1=get_val(std, std_df, ["Standard Queue 1-Level"], 0.0),
+            s1_output=get_val(std, std_df, ["Standard Station 1-Output"], 0.0),
+            q_before_batch=get_val(std, std_df, ["Standard Queue 2-Level"], 0.0),
+            initial_batch_output=get_val(std, std_df, ["Standard Initial Batching-Output"], 0.0),
+            q3=get_val(std, std_df, ["Standard Queue 3-Level"], 0.0),
+            manual_output=get_val(std, std_df, ["Standard Manual Processing-Output"], 0.0),
+            q_manual=get_val(std, std_df, ["Standard Queue 4-Level"], 0.0),
+            final_batch_output=get_val(std, std_df, ["Standard Final Batching-Output"], 0.0),
+            fg_inventory=get_val(std, std_df, ["Standard Queue 5-Level"], 0.0),
+            deliveries=get_val(std, std_df, ["Standard Deliveries-Deliveries"], 0.0),
+            market_price=get_val(std, std_df, ["Standard Deliveries-Market Price"], 0.0),
+            s1_machines=int(get_val(std, std_df, ["Standard Station 1-Number of Machines"], 1.0)),
+        ),
+        custom=CustomState(
+            accepted_orders=get_val(cus, cus_df, ["Custom Orders-Accepted Orders"], 0.0),
+            accumulated_orders=get_val(cus, cus_df, ["Custom Orders-Accumulated Orders"], 0.0),
+            q1=get_val(cus, cus_df, ["Custom Queue 1-Level"], 0.0),
+            s1_output=get_val(cus, cus_df, ["Custom Station 1-Output"], 0.0),
+            q2_first=get_val(cus, cus_df, ["Custom Queue 2-Level First Pass"], 0.0),
+            s2_first_output=get_val(cus, cus_df, ["Custom Station 2-Output First Pass"], 0.0),
+            q3=get_val(cus, cus_df, ["Custom Queue 3-Level"], 0.0),
+            s3_output=get_val(cus, cus_df, ["Custom Station 3-Output"], 0.0),
+            q2_second=get_val(cus, cus_df, ["Custom Queue 2-Level Second Pass"], 0.0),
+            deliveries=get_val(cus, cus_df, ["Custom Deliveries-Deliveries"], 0.0),
+            demand=get_val(cus, cus_df, ["Custom Orders-Demand"], 0.0),
+            s2_machines=int(get_val(cus, cus_df, ["Custom Station 2-Number of Machines"], 1.0)),
+            s3_machines=int(get_val(cus, cus_df, ["Custom Station 3-Number of Machines"], 1.0)),
+            actual_price=get_val(cus, cus_df, ["Custom Deliveries-Actual Price"], 0.0),
+            average_lead_time=get_val(cus, cus_df, ["Custom Deliveries-Average Lead Time"], 0.0),
+        ),
+        workforce=WorkforceState(
+            rookies=int(get_val(wf, wf_df, ["WorkForce-Rookies"], 0.0)),
+            experts=int(get_val(wf, wf_df, ["WorkForce-Experts"], 12.0)),
+        ),
+        finance=FinancialState(
+            cash_on_hand=get_val(fin, fin_df, ["Finance-Cash On Hand"], 0.0),
+            debt=get_val(fin, fin_df, ["Finance-Debt"], 0.0),
+            inventory_costs_to_date=get_val(fin, fin_df, ["Finance-Inventory Costs *To Date"], 0.0),
+            commission_interest_costs_to_date=get_val(fin, fin_df, ["Finance-Commission + Interest Costs *To Date"], 0.0),
+            machines_bought_to_date=get_val(fin, fin_df, ["Finance-Machines Bought *To Date"], 0.0),
+            salaries_to_date=get_val(fin, fin_df, ["Finance-Salaries *To Date"], 0.0),
+            standard_ordering_costs_to_date=get_val(fin, fin_df, ["Finance-Standard Ordering Costs *To Date"], 0.0),
+            interest_earned_to_date=get_val(fin, fin_df, ["Finance-Interest Earned *To Date"], 0.0),
+            sales_custom_to_date=get_val(fin, fin_df, ["Finance-Sales Custom *To Date"], 0.0),
+            sales_standard_to_date=get_val(fin, fin_df, ["Finance-Sales Standard *To Date"], 0.0),
+            machines_sold_to_date=get_val(fin, fin_df, ["Finance-Machines Sold *To Date"], 0.0),
+            raw_holding_costs_to_date=get_val(fin, fin_df, ["Finance-Raw Inventory Holding Costs *To Date"], 0.0),
+            custom_queue_holding_costs_to_date=get_val(fin, fin_df, ["Finance-Custom Queues Holding Costs *To Date"], 0.0),
+            standard_queue_holding_costs_to_date=get_val(fin, fin_df, ["Finance-Standard Queues Holding Costs *To Date"], 0.0),
+        ),
     )
 
-    endgame_robustness = clamp(
-        0.35 * clamp(raw_coverage / (assumptions.raw_lead_time_days + 2), 0, 1)
-        + 0.25 * (1 - cus_congestion)
-        + 0.20 * clamp(cash_buffer_adequacy / 2, 0, 1)
-        + 0.20 * (1 - clamp((std_ordering_pattern_score + batch_mismatch / max(expected_std, 1)) / 4, 0, 1)),
-        0,
-        1,
+    std_avg_demand_per_day = max(state.standard.accepted_orders, 1.0)
+    custom_avg_demand_per_day = max(state.custom.demand, 1.0)
+    expected_parts_per_day = (
+        std_avg_demand_per_day * assumptions.standard_parts_per_unit
+        + custom_avg_demand_per_day * assumptions.custom_parts_per_unit
+    )
+    raw_coverage_days = safe_div(state.inventory.inventory_level, expected_parts_per_day, 0.0)
+
+    s1_total_output = state.standard.s1_output + state.custom.s1_output
+    s1_capacity = max(s1_total_output, 1.0)
+    s1_utilization = safe_div(s1_total_output, s1_capacity, 0.0)
+
+    s2_capacity = max(state.custom.s2_first_output, 1.0)
+    s2_utilization = safe_div(state.custom.s2_first_output, s2_capacity, 0.0)
+
+    s3_capacity = max(state.custom.s3_output, 1.0)
+    s3_utilization = safe_div(state.custom.s3_output, s3_capacity, 0.0)
+
+    effective_manual_capacity = max(
+        state.workforce.experts + state.workforce.rookies * assumptions.rookie_productivity,
+        1.0,
+    )
+    manual_utilization = safe_div(state.standard.manual_output, effective_manual_capacity, 0.0)
+
+    std_batching_mismatch_score = abs(state.standard.q_before_batch - state.standard.initial_batch_output)
+
+    custom_total_wip = state.custom.q1 + state.custom.q2_first + state.custom.q2_second + state.custom.q3
+    custom_congestion_score = min(
+        1.0,
+        0.45 * safe_div(custom_total_wip, assumptions.custom_wip_limit, 0.0)
+        + 0.35 * safe_div(state.custom.average_lead_time, 20.0, 0.0)
+        + 0.20 * safe_div(max(state.custom.demand - state.custom.deliveries, 0.0), max(state.custom.demand, 1.0), 0.0),
     )
 
-    if state.day >= assumptions.player_control_last_day:
-        regime = "Endgame"
-    elif raw_coverage < assumptions.raw_lead_time_days or cus_wip_ratio > 0.85 or cash_buffer_adequacy < 0.8 or system_stress > 0.7:
+    stress_score = min(
+        1.0,
+        (
+            min(1.0, max(0.0, (assumptions.raw_lead_time_days + 1 - raw_coverage_days) / 5.0))
+            + custom_congestion_score
+            + min(1.0, max(s1_utilization, s2_utilization, s3_utilization, manual_utilization))
+        )
+        / 3.0,
+    )
+
+    if custom_congestion_score > 0.80 or raw_coverage_days < assumptions.raw_lead_time_days:
         regime = "Recovery"
-    elif system_stress > 0.40:
+    elif stress_score > 0.50:
         regime = "Stabilize"
-    else:
+    elif stress_score < 0.30 and custom_congestion_score < 0.40:
         regime = "Harvest"
+    else:
+        regime = "Endgame"
 
-    warnings = []
-    if raw_coverage < assumptions.raw_lead_time_days:
-        warnings.append("Raw coverage is below lead time. Stockout protection is required.")
-    if cus_wip_ratio > 0.85:
-        warnings.append("Custom WIP is approaching the hard limit of 750.")
-    if cus_s2_imbalance > 0.30:
-        warnings.append("Custom S2 first/second pass queues are imbalanced.")
-    if cash_buffer_adequacy < 1.0:
-        warnings.append("Cash buffer is below the target operating cushion.")
+    if state.custom.q2_second > state.custom.q2_first * 1.10:
+        bottleneck = "Custom S2 Second Pass"
+    elif state.custom.q2_first > state.custom.q1 * 1.10:
+        bottleneck = "Custom S2 First Pass"
+    elif state.custom.q3 > max(state.custom.s3_output, 1.0) * 2:
+        bottleneck = "Custom S3"
+    elif state.standard.q_before_batch > max(state.standard.initial_batch_output, 1.0) * 2:
+        bottleneck = "Standard Initial Batching"
+    elif state.standard.q_manual > max(state.standard.manual_output, 1.0) * 2:
+        bottleneck = "Standard Manual"
+    else:
+        bottleneck = "Shared S1"
 
-    return DerivedState(
-        day=state.day,
-        days_remaining=days_remaining,
-        raw_on_hand=raw_on_hand,
-        raw_on_order=raw_on_order,
-        raw_inventory_position=inventory_position,
-        expected_standard_units_per_day=expected_std,
-        expected_custom_units_per_day=expected_cus,
-        expected_parts_per_day=expected_parts,
-        raw_coverage_days=raw_coverage,
-        raw_forecast_stockout_day=raw_stockout_day,
-        raw_stockout_risk_score=raw_stockout_risk,
-        std_total_queue=std_total_queue,
-        std_wip_pressure=std_wip_pressure,
-        std_demand_delivery_gap=std_demand_gap,
-        std_price_market_gap=std_price_gap,
-        std_resource_pressure_s1=std_resource_pressure_s1,
-        std_batching_mismatch_score=batch_mismatch,
-        std_ordering_pattern_score=std_ordering_pattern_score,
-        cus_total_wip=cus_total_wip,
-        cus_wip_ratio=cus_wip_ratio,
-        cus_demand_delivery_gap=cus_demand_gap,
-        cus_lead_time_trend=cus_lt_trend,
-        cus_s2_imbalance_score=cus_s2_imbalance,
-        cus_congestion_score=cus_congestion,
-        cus_service_risk_score=cus_service_risk,
-        s1_pressure=s1_pressure,
-        s2_pressure=s2_pressure,
-        s3_pressure=s3_pressure,
-        manual_pressure=manual_pressure,
-        workforce_capacity_adequacy=workforce_capacity_adequacy,
-        daily_revenue_proxy=daily_rev,
-        daily_holding_cost_proxy=daily_holding,
-        salary_burden=salary_burden,
-        debt_burden=debt_burden,
-        cash_buffer_adequacy=cash_buffer_adequacy,
-        loan_urgency_score=loan_urgency,
-        queue_growth_rate_std=std_queue_growth,
-        queue_growth_rate_cus=cus_queue_growth,
-        system_stress_score=system_stress,
-        endgame_robustness_score=endgame_robustness,
-        current_bottleneck=current_bottleneck,
-        current_regime=regime,
-        warnings=warnings,
+    endgame_robustness = max(
+        0.0,
+        min(
+            1.0,
+            0.40 * min(1.0, raw_coverage_days / 5.0)
+            + 0.35 * (1.0 - custom_congestion_score)
+            + 0.25 * (1.0 - stress_score),
+        ),
     )
+
+    derived = DerivedState(
+        raw_coverage_days=raw_coverage_days,
+        expected_parts_per_day=expected_parts_per_day,
+        std_avg_demand_per_day=std_avg_demand_per_day,
+        custom_avg_demand_per_day=custom_avg_demand_per_day,
+        s1_utilization=s1_utilization,
+        s2_utilization=s2_utilization,
+        s3_utilization=s3_utilization,
+        manual_utilization=manual_utilization,
+        std_batching_mismatch_score=std_batching_mismatch_score,
+        custom_congestion_score=custom_congestion_score,
+        stress_score=stress_score,
+        endgame_robustness=endgame_robustness,
+        bottleneck=bottleneck,
+        current_regime=regime,
+        std_q2=state.standard.q_before_batch,
+        custom_total_wip=custom_total_wip,
+    )
+
+    return state, derived, raw
